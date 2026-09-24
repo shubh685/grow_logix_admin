@@ -1726,8 +1726,7 @@ class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
                       Icon(Icons.broken_image_outlined,
                           size: 40, color: Colors.white.withOpacity(0.3)),
                       const SizedBox(height: 8),
-                      Text('Invalid frame data',
-                          style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 11)),
+                      Text('Invalid frame data', style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 11)),
                     ],
                   ),
                 );
