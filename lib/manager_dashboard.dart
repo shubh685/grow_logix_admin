@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' as ui;
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:grow_logix_admin/Log_In.dart';
 import 'package:http/http.dart' as http;
@@ -19,6 +21,15 @@ const List<String> availableRoleChoices = [
   'Graphics Designer',
 ];
 
+// Isolated background function for non-blocking base64 decoding
+Uint8List _decodeBase64Task(String input) {
+  try {
+    return base64Decode(input);
+  } catch (_) {
+    return Uint8List(0);
+  }
+}
+
 class ManagerDashboard extends StatefulWidget {
   const ManagerDashboard({super.key});
 
@@ -28,6 +39,8 @@ class ManagerDashboard extends StatefulWidget {
 
 class _ManagerDashboardState extends State<ManagerDashboard> {
   List<Employee> _employees = [];
+  final Map<String, bool> _isActiveCache = {};
+  final Map<String, String> _lastHeartbeatCache = {};
   bool _isLoading = false;
   String _searchQuery = '';
   String _selectedRoleFilter = 'All';
@@ -68,7 +81,7 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
     _checkAndRequestManagerPermissions();
     _fetchEmployees();
 
-    _autoRefreshTimer = Timer.periodic(const Duration(seconds: 30), (timer) {
+    _autoRefreshTimer = Timer.periodic(const Duration(seconds: 15), (timer) {
       if (mounted && _employees.isNotEmpty) {
         _verifyAllEmployees();
       }
@@ -134,29 +147,6 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
             _permBullet('View live employee screens'),
             _permBullet('Access screen recording history'),
             _permBullet('Play/Stop recording remotely'),
-            const SizedBox(height: 16),
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.blue.withOpacity(0.1),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Colors.blue.withOpacity(0.3)),
-              ),
-              child: Row(
-                children: [
-                  const Icon(Icons.info_outline,
-                      color: Colors.blueAccent, size: 18),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      'You will NOT be asked again. Recording plays/stops from here.',
-                      style: TextStyle(
-                          color: Colors.white.withOpacity(0.8), fontSize: 11),
-                    ),
-                  ),
-                ],
-              ),
-            ),
           ],
         ),
         actions: [
@@ -210,14 +200,12 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
     final List<String> results = [];
 
     try {
-      // Request storage/photos on mobile (Windows = auto-managed)
       if (!Platform.isWindows) {
         try {
           final storage = await Permission.storage.request();
           final photos = await Permission.photos.request();
           results.add('Storage: ${storage.isGranted ? "✅" : "❌"}');
           results.add('Photos: ${photos.isGranted ? "✅" : "❌"}');
-          if (!storage.isGranted && !photos.isGranted) allOk = false;
         } catch (e) {
           results.add('Storage: Platform-managed');
         }
@@ -225,7 +213,6 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
         results.add('Storage: ✅ Windows managed');
       }
 
-      // Test server
       try {
         final testResponse = await http
             .get(Uri.parse(baseUrl))
@@ -237,17 +224,6 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
         }
       } catch (e) {
         results.add('Server connection: ❌ $e');
-        allOk = false;
-      }
-
-      // Test local storage
-      try {
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setString('_perm_test', 'ok');
-        await prefs.remove('_perm_test');
-        results.add('Local storage: ✅ OK');
-      } catch (e) {
-        results.add('Local storage: ❌ $e');
         allOk = false;
       }
 
@@ -356,7 +332,7 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
       final response = await http.get(
         Uri.parse('$liveStreamUrl?action=verify_employee&emp_id=$empId'),
         headers: {'Accept': 'application/json'},
-      );
+      ).timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
@@ -367,6 +343,8 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
               _pcNumberCache[empId] = emp['pc_number'] ?? 'Personal PC';
               _pcTypeCache[empId] = emp['pc_type'] ?? 'personal';
               _onlineStatusCache[empId] = data['is_online'] == true;
+              _isActiveCache[empId] = data['is_active'] == true;
+              _lastHeartbeatCache[empId] = emp['last_heartbeat'] ?? '';
               _deviceIdCache[empId] = emp['device_id'] ?? 'N/A';
               _computerNameCache[empId] = emp['computer_name'] ?? 'N/A';
               _lastSeenCache[empId] = emp['last_seen'] ?? '';
@@ -376,6 +354,7 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
           if (mounted) {
             setState(() {
               _onlineStatusCache[empId] = false;
+              _isActiveCache[empId] = false;
             });
           }
         }
@@ -467,7 +446,7 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
     }
   }
 
-  // ==================== ⭐ START/STOP LIVE (TOGGLE) ====================
+  // ==================== START/STOP LIVE ====================
   Future<void> _sendLiveRequest(Employee emp) async {
     if (_isRequestSending) return;
 
@@ -518,7 +497,6 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
     }
   }
 
-  // ⭐ STOP a specific employee's stream
   Future<void> _stopLiveForEmployee(String empId) async {
     final session = _activeSessions[empId];
     if (session == null) return;
@@ -779,6 +757,21 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
     );
   }
 
+  String _formatHeartbeat(String dt) {
+    if (dt.isEmpty) return 'N/A';
+    try {
+      final parsed = DateTime.parse(dt.replaceFirst(' ', 'T'));
+      final diff = DateTime.now().difference(parsed);
+
+      if (diff.inSeconds < 60) return '${diff.inSeconds}s ago';
+      if (diff.inMinutes < 60) return '${diff.inMinutes}m ago';
+      if (diff.inHours < 24) return '${diff.inHours}h ago';
+      return '${diff.inDays}d ago';
+    } catch (e) {
+      return 'N/A';
+    }
+  }
+
   Future<void> _handleLogout() async {
     for (final session in _activeSessions.values) {
       await session.stopAndClose();
@@ -814,7 +807,39 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
     );
   }
 
-  // ⭐ DESKTOP TABLE — Play button HIDES while streaming, STOP button shows
+  // ==================== ⭐ STATUS HELPER ====================
+  /// Returns the status info for an employee
+  Map<String, dynamic> _getStatusInfo(String empId) {
+    final isActive = _isActiveCache[empId] ?? false;
+    final isStreaming = _activeSessions.containsKey(empId);
+    final lastHeartbeat = _lastHeartbeatCache[empId] ?? '';
+
+    if (isStreaming) {
+      return {
+        'color': Colors.redAccent,
+        'text': 'Recording',
+        'subtext': 'Live now',
+        'showPulse': true,
+      };
+    } else if (isActive) {
+      return {
+        'color': Colors.greenAccent,
+        'text': 'Active',
+        'subtext': 'App running',
+        'showPulse': false,
+      };
+    } else {
+      return {
+        'color': Colors.grey,
+        'text': 'Inactive',
+        'subtext': lastHeartbeat.isNotEmpty
+            ? 'Last: ${_formatHeartbeat(lastHeartbeat)}'
+            : 'Never',
+        'showPulse': false,
+      };
+    }
+  }
+
   Widget _buildDesktopTable() {
     return SingleChildScrollView(
       scrollDirection: Axis.vertical,
@@ -848,8 +873,8 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
               final isStreaming = _activeSessions.containsKey(emp.empId);
               final pcNumber = _pcNumberCache[emp.empId] ?? 'Loading...';
               final pcType = _pcTypeCache[emp.empId] ?? 'personal';
-              final isOnline = _onlineStatusCache[emp.empId] ?? false;
               final isOfficePc = pcType == 'office';
+              final status = _getStatusInfo(emp.empId);
 
               return DataRow(cells: [
                 DataCell(Text(emp.empId,
@@ -896,6 +921,7 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
                 ),
                 DataCell(Text(emp.role,
                     style: const TextStyle(color: Colors.white))),
+                // ⭐ STATUS — Active / Inactive / Recording
                 DataCell(
                   Row(
                     mainAxisSize: MainAxisSize.min,
@@ -905,31 +931,58 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
                         height: 8,
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
-                          color: isOnline
-                              ? Colors.greenAccent
-                              : Colors.redAccent,
+                          color: status['color'] as Color,
+                          boxShadow: (status['showPulse'] as bool)
+                              ? [
+                            BoxShadow(
+                              color: (status['color'] as Color)
+                                  .withOpacity(0.6),
+                              blurRadius: 8,
+                              spreadRadius: 2,
+                            ),
+                          ]
+                              : (status['text'] == 'Active'
+                              ? [
+                            BoxShadow(
+                              color: Colors.greenAccent
+                                  .withOpacity(0.5),
+                              blurRadius: 6,
+                              spreadRadius: 1,
+                            ),
+                          ]
+                              : <BoxShadow>[]),
                         ),
                       ),
-                      const SizedBox(width: 6),
-                      Text(
-                        isOnline ? 'Online' : 'Offline',
-                        style: TextStyle(
-                          color:
-                          isOnline ? Colors.greenAccent : Colors.redAccent,
-                          fontSize: 12,
-                          fontWeight: FontWeight.w500,
-                        ),
+                      const SizedBox(width: 8),
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            status['text'] as String,
+                            style: TextStyle(
+                              color: status['color'] as Color,
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          Text(
+                            status['subtext'] as String,
+                            style: TextStyle(
+                              color: Colors.white38,
+                              fontSize: 9,
+                            ),
+                          ),
+                        ],
                       ),
                     ],
                   ),
                 ),
-                // ⭐ PLAY / STOP TOGGLE
                 DataCell(
                   Row(
                     children: [
                       if (showPlay) ...[
                         if (!isStreaming)
-                        // Show PLAY button
                           IconButton(
                             onPressed: _isRequestSending
                                 ? null
@@ -943,7 +996,6 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
                             tooltip: 'Start Live View',
                           )
                         else
-                        // Show STOP button (replaces play button)
                           IconButton(
                             onPressed: () => _stopLiveForEmployee(emp.empId),
                             icon: const Icon(
@@ -987,7 +1039,6 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
     );
   }
 
-  // ⭐ MOBILE LIST — Play/Stop toggle
   Widget _buildMobileListView() {
     return ListView.builder(
       itemCount: _filteredEmployees.length,
@@ -996,21 +1047,20 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
         final showPlay = _shouldShowPlayButton(emp.role);
         final isStreaming = _activeSessions.containsKey(emp.empId);
         final pcNumber = _pcNumberCache[emp.empId] ?? 'Loading...';
-        final isOnline = _onlineStatusCache[emp.empId] ?? false;
+        final status = _getStatusInfo(emp.empId);
 
         return Card(
           color: Colors.white.withOpacity(0.06),
           margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
           child: ListTile(
             leading: CircleAvatar(
-              backgroundColor:
-              isOnline ? Colors.greenAccent.withOpacity(0.2) : Colors.grey,
+              backgroundColor: (status['color'] as Color).withOpacity(0.2),
               child: Text(
                 emp.managerName.isNotEmpty
                     ? emp.managerName[0].toUpperCase()
                     : '?',
                 style: TextStyle(
-                  color: isOnline ? Colors.greenAccent : Colors.white70,
+                  color: status['color'] as Color,
                   fontWeight: FontWeight.bold,
                 ),
               ),
@@ -1020,9 +1070,44 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
               style: const TextStyle(
                   color: Colors.white, fontWeight: FontWeight.bold),
             ),
-            subtitle: Text(
-              '${emp.empId} | ${emp.role}\n$pcNumber | ${isOnline ? "Online" : "Offline"}',
-              style: const TextStyle(color: Colors.white70, fontSize: 11),
+            subtitle: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '${emp.empId} | ${emp.role}',
+                  style: const TextStyle(color: Colors.white70, fontSize: 11),
+                ),
+                const SizedBox(height: 4),
+                Row(
+                  children: [
+                    Container(
+                      width: 8,
+                      height: 8,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: status['color'] as Color,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      status['text'] as String,
+                      style: TextStyle(
+                        color: status['color'] as Color,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      pcNumber,
+                      style: TextStyle(
+                        color: Colors.white.withOpacity(0.5),
+                        fontSize: 11,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
             ),
             trailing: Row(
               mainAxisSize: MainAxisSize.min,
@@ -1124,10 +1209,10 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
   void _showEmployeeInfo(Employee emp) {
     final pcNumber = _pcNumberCache[emp.empId] ?? 'Loading...';
     final pcType = _pcTypeCache[emp.empId] ?? 'personal';
-    final isOnline = _onlineStatusCache[emp.empId] ?? false;
     final deviceId = _deviceIdCache[emp.empId] ?? 'N/A';
     final computerName = _computerNameCache[emp.empId] ?? 'N/A';
     final lastSeen = _lastSeenCache[emp.empId] ?? 'N/A';
+    final status = _getStatusInfo(emp.empId);
 
     showDialog(
       context: context,
@@ -1184,8 +1269,18 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
                   ],
                 ),
                 const SizedBox(height: 16),
-                _infoRow('Status', isOnline ? 'Online' : 'Offline',
-                    isOnline ? Colors.greenAccent : Colors.redAccent),
+                _infoRow(
+                  'App Status',
+                  status['text'] as String,
+                  status['color'] as Color,
+                ),
+                _infoRow(
+                  'Last Heartbeat',
+                  _lastHeartbeatCache[emp.empId]?.isNotEmpty == true
+                      ? _formatHeartbeat(_lastHeartbeatCache[emp.empId]!)
+                      : 'Never',
+                  Colors.white70,
+                ),
                 _infoRow(
                     'Device Type',
                     pcType == 'office' ? 'Office PC' : 'Personal PC',
@@ -1475,7 +1570,7 @@ class LiveStreamSession {
   final String pcType;
 
   Timer? _pollTimer;
-  String? currentFrameBase64;
+  Uint8List? currentFrameBytes;
   int refreshCount = 0;
   String status = 'waiting';
   DateTime? lastFrameTime;
@@ -1484,6 +1579,7 @@ class LiveStreamSession {
   bool isPolling = false;
   bool isMinimized = false;
   bool isDisposed = false;
+  int lastFrameCounter = -1;
 
   LiveStreamSession({
     required this.empId,
@@ -1498,7 +1594,8 @@ class LiveStreamSession {
 
     _pollTimer?.cancel();
     _fetchFrame();
-    _pollTimer = Timer.periodic(const Duration(seconds: 3), (timer) {
+    // ⭐ Poll every 2 seconds for faster updates
+    _pollTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
       if (!isDisposed) {
         _fetchFrame();
       } else {
@@ -1514,23 +1611,34 @@ class LiveStreamSession {
       final response = await http.get(
         Uri.parse('$liveStreamUrl?action=get_live_stream&emp_id=$empId'),
         headers: {'Accept': 'application/json'},
-      );
+      ).timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200 && !isDisposed) {
         final data = json.decode(response.body);
         final s = data['status'];
 
         if (s == 'success' && data['image_base64'] != null) {
-          currentFrameBase64 = data['image_base64'];
-          refreshCount++;
-          status = 'live';
-          lastFrameTime = DateTime.now();
-          windowTitle = data['window_title'];
-          if (data['captured_at'] != null) {
-            try {
-              capturedAt =
-                  DateTime.parse(data['captured_at'].replaceFirst(' ', 'T'));
-            } catch (_) {}
+          final newFrameB64 = data['image_base64'] as String;
+          final serverFrameCounter = data['frame_counter'] ?? 0;
+
+          // ⭐ Only decode if frame actually changed
+          if (serverFrameCounter != lastFrameCounter) {
+            final decodedBytes = await compute(_decodeBase64Task, newFrameB64);
+
+            if (!isDisposed && decodedBytes.isNotEmpty) {
+              currentFrameBytes = decodedBytes;
+              lastFrameCounter = serverFrameCounter;
+              refreshCount++;
+              status = 'live';
+              lastFrameTime = DateTime.now();
+              windowTitle = data['window_title'];
+              if (data['captured_at'] != null) {
+                try {
+                  capturedAt =
+                      DateTime.parse(data['captured_at'].replaceFirst(' ', 'T'));
+                } catch (_) {}
+              }
+            }
           }
         } else if (s == 'stale') {
           status = 'stale';
@@ -1632,13 +1740,6 @@ class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
                 : Colors.amber.withOpacity(0.5),
             width: 1.5,
           ),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.3),
-              blurRadius: 10,
-              offset: const Offset(0, 4),
-            ),
-          ],
         ),
         child: Row(
           children: [
@@ -1893,7 +1994,7 @@ class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
                       : Colors.white.withOpacity(0.1),
                 ),
               ),
-              child: session.currentFrameBase64 == null
+              child: session.currentFrameBytes == null
                   ? _buildWaitingView()
                   : _buildLiveView(),
             ),
@@ -1969,7 +2070,7 @@ class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
           Container(
             color: Colors.black,
             child: Image.memory(
-              base64Decode(widget.session.currentFrameBase64!),
+              widget.session.currentFrameBytes!,
               fit: BoxFit.contain,
               gaplessPlayback: true,
               errorBuilder: (context, error, stackTrace) {
@@ -2021,7 +2122,7 @@ class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
   }
 }
 
-// ==================== VIDEO HISTORY DIALOG (SMOOTH PLAYBACK) ====================
+// ==================== VIDEO HISTORY DIALOG ====================
 class _HistoryDialog extends StatefulWidget {
   final String empId;
   final String empName;
@@ -2044,26 +2145,24 @@ class _HistoryDialog extends StatefulWidget {
 }
 
 class _HistoryDialogState extends State<_HistoryDialog> {
-  // List of "videos" (one per recording session — grouped by hour/day)
   List<Map<String, dynamic>> _videoList = [];
-  // All frames (chronological, oldest first)
-  List<Map<String, dynamic>> _allFrames = [];
 
   bool _isLoading = true;
   String? _error;
 
-  // Selected video state
   int _selectedVideoIndex = -1;
   List<Map<String, dynamic>> _selectedVideoFrames = [];
+  List<Uint8List> _decodedFrames = [];
 
-  // ⭐ Playback state
   bool _isPlaying = false;
   int _playbackIndex = 0;
   Timer? _playbackTimer;
-  double _playbackSpeed = 4.0; // ⭐ 4x default (1-min frames → fast playback)
+  Timer? _autoRefreshTimer;
+  double _playbackSpeed = 4.0;
 
-  // Image cache to prevent lag
-  final Map<String, MemoryImage> _imageCache = {};
+  final ValueNotifier<int> _frameNotifier = ValueNotifier<int>(0);
+  final Map<int, ui.Image> _uiImageCache = {};
+  final Map<String, ui.Image> _thumbCache = {};
 
   @override
   void initState() {
@@ -2074,10 +2173,21 @@ class _HistoryDialogState extends State<_HistoryDialog> {
   @override
   void dispose() {
     _playbackTimer?.cancel();
+    _autoRefreshTimer?.cancel();
+    _frameNotifier.dispose();
+    for (final img in _uiImageCache.values) {
+      try {
+        img.dispose();
+      } catch (_) {}
+    }
+    for (final img in _thumbCache.values) {
+      try {
+        img.dispose();
+      } catch (_) {}
+    }
     super.dispose();
   }
 
-  // ⭐ Load and GROUP frames into "videos" (sessions)
   Future<void> _loadHistory() async {
     if (!mounted) return;
     setState(() {
@@ -2086,30 +2196,28 @@ class _HistoryDialogState extends State<_HistoryDialog> {
     });
 
     try {
-      final videoResponse = await http
+      final response = await http
           .get(
         Uri.parse(
             '$liveStreamUrl?action=get_video_playback&emp_id=${widget.empId}&limit=500'),
         headers: {'Accept': 'application/json'},
       )
-          .timeout(const Duration(seconds: 20));
+          .timeout(const Duration(seconds: 30));
 
       if (!mounted) return;
 
       List<Map<String, dynamic>> allFrames = [];
 
-      if (videoResponse.statusCode == 200) {
-        final data = json.decode(videoResponse.body);
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
         if (data['status'] == 'success' && data['frames'] != null) {
           allFrames = List<Map<String, dynamic>>.from(data['frames']);
         }
       }
 
-      // ⭐ Group frames into "videos" (sessions of ~30 min)
       final videos = _groupFramesIntoVideos(allFrames);
 
       setState(() {
-        _allFrames = allFrames;
         _videoList = videos;
         _isLoading = false;
         if (allFrames.isEmpty) {
@@ -2125,8 +2233,6 @@ class _HistoryDialogState extends State<_HistoryDialog> {
     }
   }
 
-  /// ⭐ Group frames into "videos" (sessions)
-  /// Frames with gaps > 5 minutes are considered separate sessions
   List<Map<String, dynamic>> _groupFramesIntoVideos(
       List<Map<String, dynamic>> frames) {
     if (frames.isEmpty) return [];
@@ -2137,15 +2243,13 @@ class _HistoryDialogState extends State<_HistoryDialog> {
 
     for (final frame in frames) {
       try {
-        final frameTime =
-        DateTime.parse((frame['captured_at'] as String).replaceFirst(' ', 'T'));
+        final frameTime = DateTime.parse(
+            (frame['captured_at'] as String).replaceFirst(' ', 'T'));
 
         if (lastTime == null ||
             frameTime.difference(lastTime).inMinutes <= 5) {
-          // Same session
           currentSession.add(frame);
         } else {
-          // New session → save current
           if (currentSession.isNotEmpty) {
             videos.add(_buildVideoMetadata(currentSession));
             currentSession = [];
@@ -2154,7 +2258,6 @@ class _HistoryDialogState extends State<_HistoryDialog> {
         }
         lastTime = frameTime;
       } catch (e) {
-        // Skip invalid timestamps
         currentSession.add(frame);
       }
     }
@@ -2163,7 +2266,6 @@ class _HistoryDialogState extends State<_HistoryDialog> {
       videos.add(_buildVideoMetadata(currentSession));
     }
 
-    // Return newest first
     videos.sort((a, b) {
       final aStart = a['start_time'] as String? ?? '';
       final bStart = b['start_time'] as String? ?? '';
@@ -2184,34 +2286,101 @@ class _HistoryDialogState extends State<_HistoryDialog> {
     };
   }
 
-  // ==================== PLAYBACK CONTROLS ====================
-  void _openVideo(int videoIndex) {
+  Future<ui.Image?> _decodeToUiImage(String b64) async {
+    try {
+      final bytes = base64Decode(b64);
+      final codec = await ui.instantiateImageCodec(
+        bytes,
+        targetWidth: 1280,
+      );
+      final frame = await codec.getNextFrame();
+      return frame.image;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  Future<void> _predecodeFrames(List<Map<String, dynamic>> frames) async {
+    for (final img in _uiImageCache.values) {
+      try {
+        img.dispose();
+      } catch (_) {}
+    }
+    _uiImageCache.clear();
+
+    const batchSize = 8;
+    for (int i = 0; i < frames.length; i += batchSize) {
+      final end = (i + batchSize < frames.length) ? i + batchSize : frames.length;
+
+      final futures = <Future<void>>[];
+      for (int j = i; j < end; j++) {
+        final b64 = frames[j]['image_base64'] as String?;
+        if (b64 == null || b64.isEmpty) continue;
+
+        futures.add(
+          _decodeToUiImage(b64).then((img) {
+            if (img != null && mounted) {
+              _uiImageCache[j] = img;
+            }
+          }),
+        );
+      }
+      await Future.wait(futures);
+
+      if (!mounted) return;
+
+      if (_uiImageCache.isNotEmpty) {
+        setState(() {});
+      }
+
+      await Future.delayed(const Duration(milliseconds: 2));
+    }
+
+    if (!mounted) return;
+    setState(() {});
+  }
+
+  Future<void> _openVideo(int videoIndex) async {
     final video = _videoList[videoIndex];
+    final frames = List<Map<String, dynamic>>.from(video['frames'] as List);
+
     setState(() {
       _selectedVideoIndex = videoIndex;
-      _selectedVideoFrames =
-      List<Map<String, dynamic>>.from(video['frames'] as List);
+      _selectedVideoFrames = frames;
+      _decodedFrames = [];
       _playbackIndex = 0;
       _isPlaying = false;
     });
-    _playbackTimer?.cancel();
+    _frameNotifier.value = 0;
+
+    await _predecodeFrames(frames);
   }
 
   void _closeVideo() {
     _playbackTimer?.cancel();
+    for (final img in _uiImageCache.values) {
+      try {
+        img.dispose();
+      } catch (_) {}
+    }
+    _uiImageCache.clear();
+
     setState(() {
       _selectedVideoIndex = -1;
       _selectedVideoFrames = [];
+      _decodedFrames = [];
       _isPlaying = false;
       _playbackIndex = 0;
     });
   }
 
   void _startPlayback() {
-    if (_selectedVideoFrames.isEmpty) return;
+    if (_uiImageCache.isEmpty) return;
 
     setState(() {
       _isPlaying = true;
+      _playbackIndex = 0;
+      _frameNotifier.value = 0;
     });
     _scheduleNextFrame();
   }
@@ -2227,18 +2396,14 @@ class _HistoryDialogState extends State<_HistoryDialog> {
   void _scheduleNextFrame() {
     _playbackTimer?.cancel();
 
-    // ⭐ Base interval = 200ms per frame at 1x speed
-    // (Since frames are 1-min apart, this plays ~3 frames/sec at 1x → 3 min of original content per second)
-    // At 4x → 50ms/frame
-    final intervalMs = (200 / _playbackSpeed).round().clamp(30, 2000);
+    final intervalMs = (200 / _playbackSpeed).round().clamp(30, 3000);
 
     _playbackTimer = Timer(Duration(milliseconds: intervalMs), () {
       if (!mounted || !_isPlaying) return;
 
       if (_playbackIndex < _selectedVideoFrames.length - 1) {
-        setState(() {
-          _playbackIndex++;
-        });
+        _playbackIndex++;
+        _frameNotifier.value = _playbackIndex;
         _scheduleNextFrame();
       } else {
         setState(() {
@@ -2256,6 +2421,7 @@ class _HistoryDialogState extends State<_HistoryDialog> {
   void _seekTo(int index) {
     if (index < 0 || index >= _selectedVideoFrames.length) return;
     setState(() => _playbackIndex = index);
+    _frameNotifier.value = index;
     if (_isPlaying) _scheduleNextFrame();
   }
 
@@ -2267,7 +2433,6 @@ class _HistoryDialogState extends State<_HistoryDialog> {
     _seekTo((_playbackIndex + 10).clamp(0, _selectedVideoFrames.length - 1));
   }
 
-  // ==================== HELPERS ====================
   String _formatDateTime(String? dt) {
     if (dt == null || dt.isEmpty) return 'N/A';
     try {
@@ -2293,14 +2458,6 @@ class _HistoryDialogState extends State<_HistoryDialog> {
     final h = minutes ~/ 60;
     final m = minutes % 60;
     return '${h}h ${m}m';
-  }
-
-  // ⭐ Get cached image to prevent lag
-  MemoryImage _getCachedImage(String base64Str) {
-    return _imageCache.putIfAbsent(
-      base64Str.hashCode.toString(),
-          () => MemoryImage(base64Decode(base64Str)),
-    );
   }
 
   @override
@@ -2369,7 +2526,7 @@ class _HistoryDialogState extends State<_HistoryDialog> {
               Text(
                 _selectedVideoIndex == -1
                     ? '${widget.empName} • ${widget.empId} • ${_videoList.length} videos'
-                    : '${widget.empName} • ${_selectedVideoFrames.length} frames',
+                    : '${widget.empName} • ${_selectedVideoFrames.length} frames • ${_uiImageCache.length} cached',
                 style: TextStyle(
                   color: Colors.white.withOpacity(0.5),
                   fontSize: 11,
@@ -2517,15 +2674,33 @@ class _HistoryDialogState extends State<_HistoryDialog> {
     );
   }
 
-  // ⭐ VIDEO LIST (thumbnails + metadata) — smooth, cached
   Widget _buildVideoList(bool isWide) {
+    if (_videoList.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.videocam_off,
+                size: 60, color: Colors.white.withOpacity(0.3)),
+            const SizedBox(height: 12),
+            Text(
+              'No recordings found',
+              style: TextStyle(
+                color: Colors.white.withOpacity(0.7),
+                fontSize: 14,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
     return ListView.builder(
       itemCount: _videoList.length,
       itemBuilder: (context, index) {
         final video = _videoList[index];
         final frameCount = video['frame_count'] as int;
         final startTime = video['start_time'] as String?;
-        final endTime = video['end_time'] as String?;
         final thumbnail = video['first_thumbnail'] as String?;
 
         return Card(
@@ -2542,7 +2717,6 @@ class _HistoryDialogState extends State<_HistoryDialog> {
               padding: const EdgeInsets.all(12),
               child: Row(
                 children: [
-                  // Thumbnail
                   Container(
                     width: isWide ? 120 : 80,
                     height: isWide ? 68 : 50,
@@ -2555,10 +2729,11 @@ class _HistoryDialogState extends State<_HistoryDialog> {
                     child: ClipRRect(
                       borderRadius: BorderRadius.circular(7),
                       child: thumbnail != null && thumbnail.isNotEmpty
-                          ? Image(
-                        image: _getCachedImage(thumbnail),
+                          ? Image.memory(
+                        base64Decode(thumbnail),
                         fit: BoxFit.cover,
                         gaplessPlayback: true,
+                        cacheWidth: isWide ? 240 : 160,
                         errorBuilder: (c, e, s) => const Icon(
                             Icons.videocam,
                             color: Colors.white38,
@@ -2569,7 +2744,6 @@ class _HistoryDialogState extends State<_HistoryDialog> {
                     ),
                   ),
                   const SizedBox(width: 12),
-                  // Video info
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -2625,7 +2799,6 @@ class _HistoryDialogState extends State<_HistoryDialog> {
                       ],
                     ),
                   ),
-                  // Play button
                   Container(
                     width: 40,
                     height: 40,
@@ -2647,7 +2820,6 @@ class _HistoryDialogState extends State<_HistoryDialog> {
     );
   }
 
-  // ⭐ VIDEO PLAYER (smooth, no lag)
   Widget _buildVideoPlayer(bool isWide) {
     if (_selectedVideoFrames.isEmpty) {
       return Center(
@@ -2658,13 +2830,35 @@ class _HistoryDialogState extends State<_HistoryDialog> {
       );
     }
 
-    final currentIdx =
-    _playbackIndex.clamp(0, _selectedVideoFrames.length - 1);
-    final frame = _selectedVideoFrames[currentIdx];
+    if (_uiImageCache.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const CircularProgressIndicator(color: Colors.greenAccent),
+            const SizedBox(height: 16),
+            Text(
+              'Preparing video...',
+              style: TextStyle(
+                color: Colors.white.withOpacity(0.7),
+                fontSize: 14,
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'Decoding ${_selectedVideoFrames.length} frames to GPU cache',
+              style: TextStyle(
+                color: Colors.white.withOpacity(0.5),
+                fontSize: 11,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
 
     return Column(
       children: [
-        // Main image
         Expanded(
           child: Container(
             width: double.infinity,
@@ -2680,119 +2874,127 @@ class _HistoryDialogState extends State<_HistoryDialog> {
             ),
             child: ClipRRect(
               borderRadius: BorderRadius.circular(11),
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  Image(
-                    image: _getCachedImage(frame['image_base64'] as String),
-                    fit: BoxFit.contain,
-                    gaplessPlayback: true,
-                    errorBuilder: (context, error, stackTrace) {
-                      return Center(
-                        child: Text(
-                          'Invalid image',
-                          style: TextStyle(
-                              color: Colors.white.withOpacity(0.5)),
-                        ),
-                      );
-                    },
-                  ),
-                  // Timestamp badge
-                  Positioned(
-                    top: 8,
-                    left: 8,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 6),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.8),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            _isPlaying
-                                ? Icons.play_circle_filled
-                                : Icons.access_time,
-                            color: _isPlaying
-                                ? Colors.greenAccent
-                                : Colors.lightBlueAccent,
-                            size: 12,
+              child: ValueListenableBuilder<int>(
+                valueListenable: _frameNotifier,
+                builder: (context, idx, _) {
+                  final safeIdx =
+                  idx.clamp(0, _selectedVideoFrames.length - 1);
+                  final currentFrame = _selectedVideoFrames[safeIdx];
+                  final uiImage = _uiImageCache[safeIdx];
+
+                  return Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      if (uiImage != null)
+                        Center(
+                          child: RawImage(
+                            image: uiImage,
+                            fit: BoxFit.contain,
+                            filterQuality: FilterQuality.low,
                           ),
-                          const SizedBox(width: 6),
-                          Text(
-                            _formatDateTime(frame['captured_at']),
+                        )
+                      else
+                        const Center(
+                          child: CircularProgressIndicator(
+                              color: Colors.greenAccent, strokeWidth: 2),
+                        ),
+
+                      Positioned(
+                        top: 8,
+                        left: 8,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 12, vertical: 6),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withOpacity(0.8),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                _isPlaying
+                                    ? Icons.play_circle_filled
+                                    : Icons.access_time,
+                                color: _isPlaying
+                                    ? Colors.greenAccent
+                                    : Colors.lightBlueAccent,
+                                size: 12,
+                              ),
+                              const SizedBox(width: 6),
+                              Text(
+                                _formatDateTime(currentFrame['captured_at']),
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+
+                      Positioned(
+                        top: 8,
+                        right: 8,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 10, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: _isPlaying
+                                ? Colors.greenAccent.withOpacity(0.9)
+                                : Colors.lightBlueAccent.withOpacity(0.9),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Text(
+                            _isPlaying
+                                ? '▶ ${safeIdx + 1} / ${_selectedVideoFrames.length}'
+                                : '${safeIdx + 1} / ${_selectedVideoFrames.length}',
                             style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 10,
-                              fontWeight: FontWeight.w500,
+                              color: Colors.black,
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
                             ),
                           ),
-                        ],
-                      ),
-                    ),
-                  ),
-                  // Frame counter
-                  Positioned(
-                    top: 8,
-                    right: 8,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 10, vertical: 4),
-                      decoration: BoxDecoration(
-                        color: _isPlaying
-                            ? Colors.greenAccent.withOpacity(0.9)
-                            : Colors.lightBlueAccent.withOpacity(0.9),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Text(
-                        _isPlaying
-                            ? '▶ ${currentIdx + 1} / ${_selectedVideoFrames.length}'
-                            : '${currentIdx + 1} / ${_selectedVideoFrames.length}',
-                        style: const TextStyle(
-                          color: Colors.black,
-                          fontSize: 11,
-                          fontWeight: FontWeight.bold,
                         ),
                       ),
-                    ),
-                  ),
-                  // Playing badge
-                  if (_isPlaying)
-                    Positioned(
-                      bottom: 8,
-                      right: 8,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 8, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: Colors.redAccent.withOpacity(0.9),
-                          borderRadius: BorderRadius.circular(12),
+
+                      if (_isPlaying)
+                        Positioned(
+                          bottom: 8,
+                          right: 8,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 8, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: Colors.redAccent.withOpacity(0.9),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: const Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.play_arrow,
+                                    color: Colors.white, size: 10),
+                                SizedBox(width: 4),
+                                Text('PLAYING',
+                                    style: TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 9,
+                                        fontWeight: FontWeight.bold,
+                                        letterSpacing: 1)),
+                              ],
+                            ),
+                          ),
                         ),
-                        child: const Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(Icons.play_arrow,
-                                color: Colors.white, size: 10),
-                            SizedBox(width: 4),
-                            Text('PLAYING',
-                                style: TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 9,
-                                    fontWeight: FontWeight.bold,
-                                    letterSpacing: 1)),
-                          ],
-                        ),
-                      ),
-                    ),
-                ],
+                    ],
+                  );
+                },
               ),
             ),
           ),
         ),
         const SizedBox(height: 10),
-        // ⭐ PLAYBACK CONTROLS
         _buildPlaybackControls(),
       ],
     );
@@ -2800,7 +3002,7 @@ class _HistoryDialogState extends State<_HistoryDialog> {
 
   Widget _buildPlaybackControls() {
     final totalFrames = _selectedVideoFrames.length;
-    final currentIdx = _playbackIndex.clamp(0, totalFrames - 1);
+    if (totalFrames == 0) return const SizedBox.shrink();
 
     return Container(
       padding: const EdgeInsets.all(12),
@@ -2812,26 +3014,30 @@ class _HistoryDialogState extends State<_HistoryDialog> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          // Scrubber
           if (totalFrames > 1)
-            SliderTheme(
-              data: SliderTheme.of(context).copyWith(
-                activeTrackColor: Colors.greenAccent,
-                inactiveTrackColor: Colors.white.withOpacity(0.15),
-                thumbColor: Colors.greenAccent,
-                overlayColor: Colors.greenAccent.withOpacity(0.2),
-                trackHeight: 4,
-              ),
-              child: Slider(
-                value: currentIdx.toDouble(),
-                min: 0,
-                max: (totalFrames - 1).toDouble(),
-                onChanged: (value) {
-                  final newIdx = value.round();
-                  _seekTo(newIdx);
-                },
-              ),
+            ValueListenableBuilder<int>(
+              valueListenable: _frameNotifier,
+              builder: (context, idx, _) {
+                return SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    activeTrackColor: Colors.greenAccent,
+                    inactiveTrackColor: Colors.white.withOpacity(0.15),
+                    thumbColor: Colors.greenAccent,
+                    overlayColor: Colors.greenAccent.withOpacity(0.2),
+                    trackHeight: 4,
+                  ),
+                  child: Slider(
+                    value: idx.clamp(0, totalFrames - 1).toDouble(),
+                    min: 0,
+                    max: (totalFrames - 1).toDouble(),
+                    onChanged: (value) {
+                      _seekTo(value.round());
+                    },
+                  ),
+                );
+              },
             ),
+
           if (totalFrames > 1)
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -2839,14 +3045,16 @@ class _HistoryDialogState extends State<_HistoryDialog> {
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   Text(
-                    _formatTimeOnly(_selectedVideoFrames.first['captured_at']),
+                    _formatTimeOnly(
+                        _selectedVideoFrames.first['captured_at']),
                     style: TextStyle(
                       color: Colors.white.withOpacity(0.5),
                       fontSize: 10,
                     ),
                   ),
                   Text(
-                    _formatTimeOnly(_selectedVideoFrames.last['captured_at']),
+                    _formatTimeOnly(
+                        _selectedVideoFrames.last['captured_at']),
                     style: TextStyle(
                       color: Colors.white.withOpacity(0.5),
                       fontSize: 10,
@@ -2855,8 +3063,9 @@ class _HistoryDialogState extends State<_HistoryDialog> {
                 ],
               ),
             ),
+
           const SizedBox(height: 8),
-          // Control buttons
+
           Row(
             children: [
               IconButton(
@@ -2875,8 +3084,9 @@ class _HistoryDialogState extends State<_HistoryDialog> {
                   ),
                   boxShadow: [
                     BoxShadow(
-                      color:
-                      (_isPlaying ? Colors.redAccent : Colors.greenAccent)
+                      color: (_isPlaying
+                          ? Colors.redAccent
+                          : Colors.greenAccent)
                           .withOpacity(0.4),
                       blurRadius: 12,
                       spreadRadius: 1,
@@ -2900,7 +3110,6 @@ class _HistoryDialogState extends State<_HistoryDialog> {
                 tooltip: 'Forward 10 frames',
               ),
               const SizedBox(width: 8),
-              // Speed selector
               Expanded(
                 child: SingleChildScrollView(
                   scrollDirection: Axis.horizontal,
@@ -2948,34 +3157,41 @@ class _HistoryDialogState extends State<_HistoryDialog> {
                     color: Colors.white70, size: 20),
                 onPressed: () {
                   _stopPlayback();
+                  _frameNotifier.value = 0;
                   setState(() => _playbackIndex = 0);
                 },
                 tooltip: 'Restart',
               ),
             ],
           ),
-          Padding(
-            padding: const EdgeInsets.only(top: 4),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(
-                  _isPlaying ? Icons.movie : Icons.pause_circle_outline,
-                  color: _isPlaying ? Colors.greenAccent : Colors.white54,
-                  size: 12,
+
+          ValueListenableBuilder<int>(
+            valueListenable: _frameNotifier,
+            builder: (context, idx, _) {
+              return Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      _isPlaying ? Icons.movie : Icons.pause_circle_outline,
+                      color: _isPlaying ? Colors.greenAccent : Colors.white54,
+                      size: 12,
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      _isPlaying
+                          ? 'Playing ${idx + 1} / $totalFrames  •  ${_playbackSpeed.toInt()}x'
+                          : '$totalFrames frames • ${_uiImageCache.length} cached  •  Click ▶ to play',
+                      style: TextStyle(
+                        color: Colors.white.withOpacity(0.6),
+                        fontSize: 11,
+                      ),
+                    ),
+                  ],
                 ),
-                const SizedBox(width: 6),
-                Text(
-                  _isPlaying
-                      ? 'Playing ${currentIdx + 1} / $totalFrames  •  ${_playbackSpeed}x'
-                      : '$totalFrames frames ready  •  Click ▶ to play',
-                  style: TextStyle(
-                    color: Colors.white.withOpacity(0.6),
-                    fontSize: 11,
-                  ),
-                ),
-              ],
-            ),
+              );
+            },
           ),
         ],
       ),
@@ -3038,7 +3254,9 @@ class Employee {
       'mobile': mobile,
       'role': role,
     };
-    if (password.isNotEmpty) data['password'] = password;
+    if (password.isNotEmpty) {
+      data['password'] = password;
+    }
     return data;
   }
 }
