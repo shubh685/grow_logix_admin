@@ -47,6 +47,7 @@ dependencies:
   screenshot: ^3.0.0
   win32: ^5.0.7
   ffi: ^2.1.0
+  permission_handler: ^11.3.0
 dev_dependencies:
   flutter_test:
     sdk: flutter

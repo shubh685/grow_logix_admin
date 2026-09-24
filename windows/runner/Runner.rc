@@ -2,7 +2,7 @@
 //
 #pragma code_page(65001)
 #include "resource.h"
-
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "runner.exe.manifest"
 #define APSTUDIO_READONLY_SYMBOLS
 /////////////////////////////////////////////////////////////////////////////
 //
