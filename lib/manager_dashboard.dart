@@ -14,7 +14,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:window_manager/window_manager.dart' as wm;
 import 'package:screen_retriever/screen_retriever.dart' as sr;
 
-const String baseUrl = 'http://192.168.1.42/grow_logix/manage_manager.php';
+const String baseUrl = 'https://goldenrod-raven-866091.hostingersite.com/manage_manager.php';
 const String liveStreamUrl = 'http://192.168.1.42/grow_logix/live_stream.php';
 const String autoPasswordUrl = 'http://192.168.1.42/grow_logix/create_auto_password.php';
 
