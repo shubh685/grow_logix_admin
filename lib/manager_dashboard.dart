@@ -9,6 +9,11 @@ import 'package:http/http.dart' as http;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+// ⭐ SAFE: only import platform-specific packages on desktop
+// (prevents tree-shaking issues when the .exe is built for Windows)
+import 'package:window_manager/window_manager.dart' as wm;
+import 'package:screen_retriever/screen_retriever.dart' as sr;
+
 const String baseUrl = 'http://192.168.1.42/grow_logix/manage_manager.php';
 const String liveStreamUrl = 'http://192.168.1.42/grow_logix/live_stream.php';
 const String autoPasswordUrl = 'http://192.168.1.42/grow_logix/create_auto_password.php';
@@ -51,12 +56,12 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
   final Map<String, LiveStreamSession> _activeSessions = {};
   bool _isRequestSending = false;
 
-  // ===== Caches from verify_employee (all device info comes from devices table) =====
-  final Map<String, String> _pcNumberCache = {};       // "Personal PC" or "PC-01"
-  final Map<String, String> _pcTypeCache = {};         // 'personal' or 'office'
+  // ===== Caches from verify_employee =====
+  final Map<String, String> _pcNumberCache = {};
+  final Map<String, String> _pcTypeCache = {};
   final Map<String, bool> _onlineStatusCache = {};
-  final Map<String, String> _deviceIdCache = {};       // devices.device_id
-  final Map<String, String> _computerNameCache = {};   // devices.device_name
+  final Map<String, String> _deviceIdCache = {};
+  final Map<String, String> _computerNameCache = {};
   final Map<String, String> _lastSeenCache = {};
 
   final List<String> _allowedPlayRoles = [
@@ -80,6 +85,7 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
   @override
   void initState() {
     super.initState();
+    _initDesktopPlugins();          // ⭐ SAFE plugin init
     _checkAndRequestManagerPermissions();
     _fetchEmployees();
 
@@ -88,6 +94,25 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
         _verifyAllEmployees();
       }
     });
+  }
+
+  // ⭐ Initialize desktop plugins safely (no crash if DLL missing)
+  Future<void> _initDesktopPlugins() async {
+    if (!Platform.isWindows && !Platform.isLinux && !Platform.isMacOS) return;
+    try {
+      await wm.windowManager.ensureInitialized();
+      await wm.windowManager.setPreventClose(false);
+      debugPrint('✅ window_manager initialized');
+    } catch (e) {
+      debugPrint('⚠️ window_manager not available: $e');
+    }
+    try {
+      // Touch screen_retriever so the plugin loads
+      await sr.screenRetriever.getPrimaryDisplay();
+      debugPrint('✅ screen_retriever initialized');
+    } catch (e) {
+      debugPrint('⚠️ screen_retriever not available: $e');
+    }
   }
 
   @override
@@ -229,6 +254,14 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
         allOk = false;
       }
 
+      // ⭐ Verify screen_retriever plugin works (solves DLL issues at runtime)
+      try {
+        final disp = await sr.screenRetriever.getPrimaryDisplay();
+        results.add('Screen retriever: ✅ ${disp.size.width.toInt()}x${disp.size.height.toInt()}');
+      } catch (e) {
+        results.add('Screen retriever: ⚠️ $e');
+      }
+
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool(_managerPermKey, true);
       setState(() => _permissionsGranted = true);
@@ -277,8 +310,7 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
                   backgroundColor: const Color(0xFFE94560),
                 ),
                 onPressed: () => Navigator.pop(ctx),
-                child:
-                const Text('OK', style: TextStyle(color: Colors.white)),
+                child: const Text('OK', style: TextStyle(color: Colors.white)),
               ),
             ],
           ),
@@ -341,7 +373,6 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
         if (data['status'] == 'success' && data['employee'] != null) {
           final emp = data['employee'];
 
-          // ⭐ Safe string extraction helper
           String safeStr(dynamic v, [String fallback = 'N/A']) {
             if (v == null) return fallback;
             final s = v.toString().trim();
@@ -351,26 +382,20 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
 
           if (mounted) {
             setState(() {
-              // ===== PC number & type =====
-              // Server returns:
-              //   pc_type = 'office' + pc_number = "PC-01"  → office
-              //   pc_type = 'personal' + pc_number = "Personal PC" → personal
               final rawPcNumber = safeStr(emp['pc_number'], 'Personal PC');
-              final rawPcType   = safeStr(emp['pc_type'], 'personal').toLowerCase();
+              final rawPcType =
+              safeStr(emp['pc_type'], 'personal').toLowerCase();
 
-              _pcTypeCache[empId]   = rawPcType;
+              _pcTypeCache[empId] = rawPcType;
               _pcNumberCache[empId] = rawPcNumber;
 
-              // ===== Status flags =====
-              _onlineStatusCache[empId]  = data['is_online'] == true;
-              _isActiveCache[empId]      = data['is_active'] == true;
+              _onlineStatusCache[empId] = data['is_online'] == true;
+              _isActiveCache[empId] = data['is_active'] == true;
               _lastHeartbeatCache[empId] = safeStr(emp['last_heartbeat'], '');
 
-              // ⭐ Device ID — from devices.device_id (N/A if none)
               _deviceIdCache[empId] = safeStr(emp['device_id'], 'N/A');
 
-              // ⭐ Device Name — from devices.device_name
-              final devName  = safeStr(emp['device_name'], '');
+              final devName = safeStr(emp['device_name'], '');
               final compName = safeStr(emp['computer_name'], '');
               _computerNameCache[empId] =
               devName.isNotEmpty && devName != 'N/A'
@@ -379,7 +404,6 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
                   ? compName
                   : 'N/A');
 
-              // ===== Last seen =====
               _lastSeenCache[empId] = safeStr(emp['last_seen'], '');
             });
           }
@@ -387,7 +411,7 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
           if (mounted) {
             setState(() {
               _onlineStatusCache[empId] = false;
-              _isActiveCache[empId]     = false;
+              _isActiveCache[empId] = false;
             });
           }
         }
@@ -414,7 +438,7 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
     return 'GS-E-01';
   }
 
-  // ==================== ⭐ AUTO PASSWORD API ====================
+  // ==================== AUTO PASSWORD API ====================
   Future<String?> _fetchAutoPassword(String empName, String role) async {
     try {
       final response = await http.post(
@@ -441,10 +465,7 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
           return null;
         }
       } else {
-        _showSnackBar(
-          'Server error: ${response.statusCode}',
-          isError: true,
-        );
+        _showSnackBar('Server error: ${response.statusCode}', isError: true);
         return null;
       }
     } catch (e) {
@@ -898,7 +919,6 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
     );
   }
 
-  // ==================== STATUS HELPER ====================
   Map<String, dynamic> _getStatusInfo(String empId) {
     final isActive = _isActiveCache[empId] ?? false;
     final isStreaming = _activeSessions.containsKey(empId);
@@ -930,15 +950,11 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
     }
   }
 
-  /// ⭐ Chip-style widget for PC number / type
-  /// - Office PC → green chip with "PC-01"
-  /// - Personal PC → blue-grey chip with "Personal PC"
   Widget _buildPcChip(String empId) {
     final pcNumber = _pcNumberCache[empId] ?? 'Personal PC';
-    final pcType   = _pcTypeCache[empId] ?? 'personal';
+    final pcType = _pcTypeCache[empId] ?? 'personal';
     final isOfficePc = pcType == 'office';
 
-    // Ensure the label is never blank
     final label = (pcNumber.isEmpty ||
         pcNumber.toLowerCase() == 'null' ||
         pcNumber == 'N/A')
@@ -1307,14 +1323,13 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
   }
 
   void _showEmployeeInfo(Employee emp) {
-    final pcNumber     = _pcNumberCache[emp.empId] ?? 'Personal PC';
-    final pcType       = _pcTypeCache[emp.empId] ?? 'personal';
-    final deviceId     = _deviceIdCache[emp.empId] ?? 'N/A';
+    final pcNumber = _pcNumberCache[emp.empId] ?? 'Personal PC';
+    final pcType = _pcTypeCache[emp.empId] ?? 'personal';
+    final deviceId = _deviceIdCache[emp.empId] ?? 'N/A';
     final computerName = _computerNameCache[emp.empId] ?? 'N/A';
-    final lastSeen     = _lastSeenCache[emp.empId] ?? 'N/A';
-    final status       = _getStatusInfo(emp.empId);
+    final lastSeen = _lastSeenCache[emp.empId] ?? 'N/A';
+    final status = _getStatusInfo(emp.empId);
 
-    // Fallback for empty pc_number
     final pcDisplay = (pcNumber.isEmpty ||
         pcNumber.toLowerCase() == 'null' ||
         pcNumber == 'N/A')
@@ -1397,7 +1412,8 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
                 _infoRow('PC Number', pcDisplay, Colors.white),
                 _infoRow('Device ID', deviceId, Colors.white70),
                 _infoRow('Computer Name', computerName, Colors.white70),
-                _infoRow('Last Seen', _formatDateTime(lastSeen), Colors.white70),
+                _infoRow(
+                    'Last Seen', _formatDateTime(lastSeen), Colors.white70),
                 _infoRow('Email', emp.email, Colors.white70),
                 _infoRow('Mobile', emp.mobile, Colors.white70),
               ],
@@ -1451,7 +1467,7 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
 
   Future<void> _showHistoryDialog(Employee emp) async {
     final pcNumber = _pcNumberCache[emp.empId] ?? 'Personal PC';
-    final pcType   = _pcTypeCache[emp.empId] ?? 'personal';
+    final pcType = _pcTypeCache[emp.empId] ?? 'personal';
 
     showDialog(
       context: context,
@@ -1594,8 +1610,8 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
                                 (!canGeneratePwd || isGeneratingPwd)
                                     ? null
                                     : () async {
-                                  setDialogState(() =>
-                                  isGeneratingPwd = true);
+                                  setDialogState(
+                                          () => isGeneratingPwd = true);
 
                                   String? pwd =
                                   await _fetchAutoPassword(
@@ -1729,8 +1745,8 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
                                 (!canGeneratePwd || isGeneratingPwd)
                                     ? null
                                     : () async {
-                                  setDialogState(() =>
-                                  isGeneratingPwd = true);
+                                  setDialogState(
+                                          () => isGeneratingPwd = true);
 
                                   String? pwd =
                                   await _fetchAutoPassword(
@@ -1872,8 +1888,8 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
 class LiveStreamSession {
   final String empId;
   final String empName;
-  final String pcNumber;   // "Personal PC" or "PC-01"
-  final String pcType;     // 'personal' or 'office'
+  final String pcNumber;
+  final String pcType;
 
   Timer? _pollTimer;
   Uint8List? currentFrameBytes;
@@ -1900,7 +1916,6 @@ class LiveStreamSession {
 
     _pollTimer?.cancel();
     _fetchFrame();
-    // ⭐ Faster polling for near-realtime + immediate follow-up after request
     _pollTimer = Timer.periodic(const Duration(milliseconds: 1500), (timer) {
       if (!isDisposed) {
         _fetchFrame();
@@ -1916,10 +1931,10 @@ class LiveStreamSession {
     try {
       final response = await http.get(
         Uri.parse('$liveStreamUrl?action=get_live_stream&emp_id=$empId'
-            '&_ts=${DateTime.now().millisecondsSinceEpoch}'), // ⭐ cache buster
+            '&_ts=${DateTime.now().millisecondsSinceEpoch}'),
         headers: {
           'Accept': 'application/json',
-          'Cache-Control': 'no-cache',                       // ⭐ no stale
+          'Cache-Control': 'no-cache',
         },
       ).timeout(const Duration(seconds: 10));
 
@@ -1931,7 +1946,6 @@ class LiveStreamSession {
           final newFrameB64 = data['image_base64'] as String;
           final serverFrameCounter = data['frame_counter'] ?? 0;
 
-          // ⭐ Always decode if server has a *newer* counter than ours
           if (serverFrameCounter != lastFrameCounter) {
             final decodedBytes = await compute(_decodeBase64Task, newFrameB64);
 
@@ -2007,10 +2021,8 @@ class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
   Timer? _uiTimer;
 
   @override
-  @override
   void initState() {
     super.initState();
-    // ⭐ 250 ms repaint → smoother live view (was 500 ms)
     _uiTimer = Timer.periodic(const Duration(milliseconds: 250), (timer) {
       if (mounted) setState(() {});
     });
