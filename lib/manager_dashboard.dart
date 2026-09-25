@@ -1900,7 +1900,8 @@ class LiveStreamSession {
 
     _pollTimer?.cancel();
     _fetchFrame();
-    _pollTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
+    // ⭐ Faster polling for near-realtime + immediate follow-up after request
+    _pollTimer = Timer.periodic(const Duration(milliseconds: 1500), (timer) {
       if (!isDisposed) {
         _fetchFrame();
       } else {
@@ -1914,8 +1915,12 @@ class LiveStreamSession {
 
     try {
       final response = await http.get(
-        Uri.parse('$liveStreamUrl?action=get_live_stream&emp_id=$empId'),
-        headers: {'Accept': 'application/json'},
+        Uri.parse('$liveStreamUrl?action=get_live_stream&emp_id=$empId'
+            '&_ts=${DateTime.now().millisecondsSinceEpoch}'), // ⭐ cache buster
+        headers: {
+          'Accept': 'application/json',
+          'Cache-Control': 'no-cache',                       // ⭐ no stale
+        },
       ).timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200 && !isDisposed) {
@@ -1926,6 +1931,7 @@ class LiveStreamSession {
           final newFrameB64 = data['image_base64'] as String;
           final serverFrameCounter = data['frame_counter'] ?? 0;
 
+          // ⭐ Always decode if server has a *newer* counter than ours
           if (serverFrameCounter != lastFrameCounter) {
             final decodedBytes = await compute(_decodeBase64Task, newFrameB64);
 
@@ -2001,9 +2007,11 @@ class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
   Timer? _uiTimer;
 
   @override
+  @override
   void initState() {
     super.initState();
-    _uiTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) {
+    // ⭐ 250 ms repaint → smoother live view (was 500 ms)
+    _uiTimer = Timer.periodic(const Duration(milliseconds: 250), (timer) {
       if (mounted) setState(() {});
     });
   }
