@@ -11,6 +11,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 const String baseUrl = 'http://192.168.1.42/grow_logix/manage_manager.php';
 const String liveStreamUrl = 'http://192.168.1.42/grow_logix/live_stream.php';
+const String autoPasswordUrl = 'http://192.168.1.42/grow_logix/create_auto_password.php';
 
 const List<String> availableRoleChoices = [
   'Website Developer',
@@ -50,11 +51,12 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
   final Map<String, LiveStreamSession> _activeSessions = {};
   bool _isRequestSending = false;
 
-  final Map<String, String> _pcNumberCache = {};
-  final Map<String, String> _pcTypeCache = {};
+  // ===== Caches from verify_employee (all device info comes from devices table) =====
+  final Map<String, String> _pcNumberCache = {};       // "Personal PC" or "PC-01"
+  final Map<String, String> _pcTypeCache = {};         // 'personal' or 'office'
   final Map<String, bool> _onlineStatusCache = {};
-  final Map<String, String> _deviceIdCache = {};
-  final Map<String, String> _computerNameCache = {};
+  final Map<String, String> _deviceIdCache = {};       // devices.device_id
+  final Map<String, String> _computerNameCache = {};   // devices.device_name
   final Map<String, String> _lastSeenCache = {};
 
   final List<String> _allowedPlayRoles = [
@@ -338,23 +340,54 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
         final data = json.decode(response.body);
         if (data['status'] == 'success' && data['employee'] != null) {
           final emp = data['employee'];
+
+          // ⭐ Safe string extraction helper
+          String safeStr(dynamic v, [String fallback = 'N/A']) {
+            if (v == null) return fallback;
+            final s = v.toString().trim();
+            if (s.isEmpty || s.toLowerCase() == 'null') return fallback;
+            return s;
+          }
+
           if (mounted) {
             setState(() {
-              _pcNumberCache[empId] = emp['pc_number'] ?? 'Personal PC';
-              _pcTypeCache[empId] = emp['pc_type'] ?? 'personal';
-              _onlineStatusCache[empId] = data['is_online'] == true;
-              _isActiveCache[empId] = data['is_active'] == true;
-              _lastHeartbeatCache[empId] = emp['last_heartbeat'] ?? '';
-              _deviceIdCache[empId] = emp['device_id'] ?? 'N/A';
-              _computerNameCache[empId] = emp['computer_name'] ?? 'N/A';
-              _lastSeenCache[empId] = emp['last_seen'] ?? '';
+              // ===== PC number & type =====
+              // Server returns:
+              //   pc_type = 'office' + pc_number = "PC-01"  → office
+              //   pc_type = 'personal' + pc_number = "Personal PC" → personal
+              final rawPcNumber = safeStr(emp['pc_number'], 'Personal PC');
+              final rawPcType   = safeStr(emp['pc_type'], 'personal').toLowerCase();
+
+              _pcTypeCache[empId]   = rawPcType;
+              _pcNumberCache[empId] = rawPcNumber;
+
+              // ===== Status flags =====
+              _onlineStatusCache[empId]  = data['is_online'] == true;
+              _isActiveCache[empId]      = data['is_active'] == true;
+              _lastHeartbeatCache[empId] = safeStr(emp['last_heartbeat'], '');
+
+              // ⭐ Device ID — from devices.device_id (N/A if none)
+              _deviceIdCache[empId] = safeStr(emp['device_id'], 'N/A');
+
+              // ⭐ Device Name — from devices.device_name
+              final devName  = safeStr(emp['device_name'], '');
+              final compName = safeStr(emp['computer_name'], '');
+              _computerNameCache[empId] =
+              devName.isNotEmpty && devName != 'N/A'
+                  ? devName
+                  : (compName.isNotEmpty && compName != 'N/A'
+                  ? compName
+                  : 'N/A');
+
+              // ===== Last seen =====
+              _lastSeenCache[empId] = safeStr(emp['last_seen'], '');
             });
           }
         } else {
           if (mounted) {
             setState(() {
               _onlineStatusCache[empId] = false;
-              _isActiveCache[empId] = false;
+              _isActiveCache[empId]     = false;
             });
           }
         }
@@ -379,6 +412,64 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
       debugPrint('Error fetching EMP ID: $e');
     }
     return 'GS-E-01';
+  }
+
+  // ==================== ⭐ AUTO PASSWORD API ====================
+  Future<String?> _fetchAutoPassword(String empName, String role) async {
+    try {
+      final response = await http.post(
+        Uri.parse(autoPasswordUrl),
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: json.encode({
+          'name': empName.trim(),
+          'role': role.trim(),
+        }),
+      ).timeout(const Duration(seconds: 15));
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        if (data['status'] == 'success' && data['auto_password'] != null) {
+          return data['auto_password'].toString();
+        } else {
+          _showSnackBar(
+            data['message'] ?? 'Failed to generate auto password',
+            isError: true,
+          );
+          return null;
+        }
+      } else {
+        _showSnackBar(
+          'Server error: ${response.statusCode}',
+          isError: true,
+        );
+        return null;
+      }
+    } catch (e) {
+      _showSnackBar('Error generating password: $e', isError: true);
+      return null;
+    }
+  }
+
+  String _generateLocalAutoPassword(String empName, String role) {
+    String cleanName = empName
+        .trim()
+        .replaceAll(RegExp(r'[^a-zA-Z0-9]'), '')
+        .toLowerCase();
+
+    if (cleanName.isEmpty) cleanName = 'employee';
+    if (cleanName.length > 8) cleanName = cleanName.substring(0, 8);
+
+    int existingCount = _employees
+        .where((e) =>
+    e.role == role &&
+        e.managerName.toLowerCase().contains(cleanName))
+        .length;
+
+    int counter = existingCount + 1;
+    return 'GS-$cleanName:@${counter.toString().padLeft(2, '0')}';
   }
 
   Future<bool> _createEmployee(Employee emp) async {
@@ -807,8 +898,7 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
     );
   }
 
-  // ==================== ⭐ STATUS HELPER ====================
-  /// Returns the status info for an employee
+  // ==================== STATUS HELPER ====================
   Map<String, dynamic> _getStatusInfo(String empId) {
     final isActive = _isActiveCache[empId] ?? false;
     final isStreaming = _activeSessions.containsKey(empId);
@@ -838,6 +928,54 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
         'showPulse': false,
       };
     }
+  }
+
+  /// ⭐ Chip-style widget for PC number / type
+  /// - Office PC → green chip with "PC-01"
+  /// - Personal PC → blue-grey chip with "Personal PC"
+  Widget _buildPcChip(String empId) {
+    final pcNumber = _pcNumberCache[empId] ?? 'Personal PC';
+    final pcType   = _pcTypeCache[empId] ?? 'personal';
+    final isOfficePc = pcType == 'office';
+
+    // Ensure the label is never blank
+    final label = (pcNumber.isEmpty ||
+        pcNumber.toLowerCase() == 'null' ||
+        pcNumber == 'N/A')
+        ? 'Personal PC'
+        : pcNumber;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: isOfficePc
+            ? Colors.green.withOpacity(0.2)
+            : Colors.blueGrey.withOpacity(0.2),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+          color: isOfficePc ? Colors.green : Colors.blueGrey,
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            isOfficePc ? Icons.computer : Icons.laptop_mac,
+            size: 14,
+            color: isOfficePc ? Colors.greenAccent : Colors.lightBlueAccent,
+          ),
+          const SizedBox(width: 6),
+          Text(
+            label,
+            style: TextStyle(
+              color: isOfficePc ? Colors.greenAccent : Colors.lightBlueAccent,
+              fontWeight: FontWeight.bold,
+              fontSize: 12,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Widget _buildDesktopTable() {
@@ -871,9 +1009,6 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
             rows: _filteredEmployees.map((emp) {
               final showPlay = _shouldShowPlayButton(emp.role);
               final isStreaming = _activeSessions.containsKey(emp.empId);
-              final pcNumber = _pcNumberCache[emp.empId] ?? 'Loading...';
-              final pcType = _pcTypeCache[emp.empId] ?? 'personal';
-              final isOfficePc = pcType == 'office';
               final status = _getStatusInfo(emp.empId);
 
               return DataRow(cells: [
@@ -881,47 +1016,9 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
                     style: const TextStyle(color: Colors.white))),
                 DataCell(Text(emp.managerName,
                     style: const TextStyle(color: Colors.white))),
-                DataCell(
-                  Container(
-                    padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: isOfficePc
-                          ? Colors.green.withOpacity(0.2)
-                          : Colors.blueGrey.withOpacity(0.2),
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(
-                        color: isOfficePc ? Colors.green : Colors.blueGrey,
-                      ),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          isOfficePc ? Icons.computer : Icons.laptop_mac,
-                          size: 14,
-                          color: isOfficePc
-                              ? Colors.greenAccent
-                              : Colors.lightBlueAccent,
-                        ),
-                        const SizedBox(width: 6),
-                        Text(
-                          pcNumber,
-                          style: TextStyle(
-                            color: isOfficePc
-                                ? Colors.greenAccent
-                                : Colors.lightBlueAccent,
-                            fontWeight: FontWeight.bold,
-                            fontSize: 12,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
+                DataCell(_buildPcChip(emp.empId)),
                 DataCell(Text(emp.role,
                     style: const TextStyle(color: Colors.white))),
-                // ⭐ STATUS — Active / Inactive / Recording
                 DataCell(
                   Row(
                     mainAxisSize: MainAxisSize.min,
@@ -968,7 +1065,7 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
                           ),
                           Text(
                             status['subtext'] as String,
-                            style: TextStyle(
+                            style: const TextStyle(
                               color: Colors.white38,
                               fontSize: 9,
                             ),
@@ -1046,8 +1143,8 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
         final emp = _filteredEmployees[index];
         final showPlay = _shouldShowPlayButton(emp.role);
         final isStreaming = _activeSessions.containsKey(emp.empId);
-        final pcNumber = _pcNumberCache[emp.empId] ?? 'Loading...';
         final status = _getStatusInfo(emp.empId);
+        final pcNumber = _pcNumberCache[emp.empId] ?? 'Loading...';
 
         return Card(
           color: Colors.white.withOpacity(0.06),
@@ -1098,11 +1195,14 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
                       ),
                     ),
                     const SizedBox(width: 8),
-                    Text(
-                      pcNumber,
-                      style: TextStyle(
-                        color: Colors.white.withOpacity(0.5),
-                        fontSize: 11,
+                    Flexible(
+                      child: Text(
+                        pcNumber,
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(0.5),
+                          fontSize: 11,
+                        ),
+                        overflow: TextOverflow.ellipsis,
                       ),
                     ),
                   ],
@@ -1207,12 +1307,19 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
   }
 
   void _showEmployeeInfo(Employee emp) {
-    final pcNumber = _pcNumberCache[emp.empId] ?? 'Loading...';
-    final pcType = _pcTypeCache[emp.empId] ?? 'personal';
-    final deviceId = _deviceIdCache[emp.empId] ?? 'N/A';
+    final pcNumber     = _pcNumberCache[emp.empId] ?? 'Personal PC';
+    final pcType       = _pcTypeCache[emp.empId] ?? 'personal';
+    final deviceId     = _deviceIdCache[emp.empId] ?? 'N/A';
     final computerName = _computerNameCache[emp.empId] ?? 'N/A';
-    final lastSeen = _lastSeenCache[emp.empId] ?? 'N/A';
-    final status = _getStatusInfo(emp.empId);
+    final lastSeen     = _lastSeenCache[emp.empId] ?? 'N/A';
+    final status       = _getStatusInfo(emp.empId);
+
+    // Fallback for empty pc_number
+    final pcDisplay = (pcNumber.isEmpty ||
+        pcNumber.toLowerCase() == 'null' ||
+        pcNumber == 'N/A')
+        ? 'Personal PC'
+        : pcNumber;
 
     showDialog(
       context: context,
@@ -1287,11 +1394,10 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
                     pcType == 'office'
                         ? Colors.greenAccent
                         : Colors.lightBlueAccent),
-                _infoRow('PC Number', pcNumber, Colors.white),
+                _infoRow('PC Number', pcDisplay, Colors.white),
                 _infoRow('Device ID', deviceId, Colors.white70),
                 _infoRow('Computer Name', computerName, Colors.white70),
-                _infoRow(
-                    'Last Seen', _formatDateTime(lastSeen), Colors.white70),
+                _infoRow('Last Seen', _formatDateTime(lastSeen), Colors.white70),
                 _infoRow('Email', emp.email, Colors.white70),
                 _infoRow('Mobile', emp.mobile, Colors.white70),
               ],
@@ -1344,14 +1450,21 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
   }
 
   Future<void> _showHistoryDialog(Employee emp) async {
+    final pcNumber = _pcNumberCache[emp.empId] ?? 'Personal PC';
+    final pcType   = _pcTypeCache[emp.empId] ?? 'personal';
+
     showDialog(
       context: context,
       builder: (context) {
         return _HistoryDialog(
           empId: emp.empId,
           empName: emp.managerName,
-          pcNumber: _pcNumberCache[emp.empId] ?? 'N/A',
-          pcType: _pcTypeCache[emp.empId] ?? 'personal',
+          pcNumber: (pcNumber.isEmpty ||
+              pcNumber.toLowerCase() == 'null' ||
+              pcNumber == 'N/A')
+              ? 'Personal PC'
+              : pcNumber,
+          pcType: pcType,
           deviceId: _deviceIdCache[emp.empId] ?? 'N/A',
           computerName: _computerNameCache[emp.empId] ?? 'N/A',
         );
@@ -1359,6 +1472,7 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
     );
   }
 
+  // ==================== EMPLOYEE FORM WITH AUTO PASSWORD ====================
   void _showEmployeeForm({Employee? employee}) async {
     final formKey = GlobalKey<FormState>();
     final isEditing = employee != null;
@@ -1373,6 +1487,7 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
     String empId = employee?.empId ?? '';
     String selectedRole = employee?.role ?? availableRoleChoices.first;
     bool isSubmitting = false;
+    bool isGeneratingPwd = false;
 
     if (!isEditing) {
       empId = await _fetchNextEmpId();
@@ -1386,6 +1501,9 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
       builder: (context) {
         return StatefulBuilder(
           builder: (context, setDialogState) {
+            final canGeneratePwd = nameController.text.trim().length >= 3 &&
+                selectedRole.isNotEmpty;
+
             return AlertDialog(
               backgroundColor: const Color(0xFF16213E),
               shape: RoundedRectangleBorder(
@@ -1406,24 +1524,105 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
                         readOnly: true,
                         style: const TextStyle(color: Colors.white70),
                         decoration: const InputDecoration(
-                          labelText: 'Employee ID',
+                          labelText: 'Employee ID (auto)',
                           labelStyle: TextStyle(color: Colors.white60),
+                          prefixIcon: Icon(Icons.badge,
+                              color: Colors.lightBlueAccent, size: 20),
                           enabledBorder: UnderlineInputBorder(
                             borderSide: BorderSide(color: Colors.white24),
                           ),
                         ),
                       ),
                       const SizedBox(height: 12),
-                      TextFormField(
-                        controller: nameController,
-                        style: const TextStyle(color: Colors.white),
-                        decoration: const InputDecoration(
-                          labelText: 'Full Name',
-                          labelStyle: TextStyle(color: Colors.white60),
-                        ),
-                        validator: (val) => val == null || val.trim().isEmpty
-                            ? 'Enter full name'
-                            : null,
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Expanded(
+                            child: TextFormField(
+                              controller: nameController,
+                              style: const TextStyle(color: Colors.white),
+                              onChanged: (_) => setDialogState(() {}),
+                              decoration: const InputDecoration(
+                                labelText: 'Full Name',
+                                labelStyle: TextStyle(color: Colors.white60),
+                                prefixIcon: Icon(Icons.person,
+                                    color: Colors.white54, size: 20),
+                              ),
+                              validator: (val) =>
+                              val == null || val.trim().isEmpty
+                                  ? 'Enter full name'
+                                  : null,
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Tooltip(
+                            message: canGeneratePwd
+                                ? 'Generate auto password (GS-name:@01)'
+                                : 'Enter name & role first',
+                            child: Container(
+                              height: 48,
+                              width: 48,
+                              margin: const EdgeInsets.only(top: 8),
+                              decoration: BoxDecoration(
+                                color: canGeneratePwd
+                                    ? const Color(0xFFE94560)
+                                    : Colors.white12,
+                                borderRadius: BorderRadius.circular(10),
+                                boxShadow: canGeneratePwd
+                                    ? [
+                                  BoxShadow(
+                                    color: const Color(0xFFE94560)
+                                        .withOpacity(0.4),
+                                    blurRadius: 8,
+                                    spreadRadius: 1,
+                                  ),
+                                ]
+                                    : [],
+                              ),
+                              child: IconButton(
+                                icon: isGeneratingPwd
+                                    ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white),
+                                )
+                                    : const Icon(Icons.add,
+                                    color: Colors.white, size: 24),
+                                onPressed:
+                                (!canGeneratePwd || isGeneratingPwd)
+                                    ? null
+                                    : () async {
+                                  setDialogState(() =>
+                                  isGeneratingPwd = true);
+
+                                  String? pwd =
+                                  await _fetchAutoPassword(
+                                    nameController.text.trim(),
+                                    selectedRole,
+                                  );
+
+                                  pwd ??=
+                                      _generateLocalAutoPassword(
+                                        nameController.text.trim(),
+                                        selectedRole,
+                                      );
+
+                                  passwordController.text = pwd;
+
+                                  if (mounted) {
+                                    setDialogState(() {
+                                      isGeneratingPwd = false;
+                                    });
+                                    _showSnackBar(
+                                        '🔑 Auto password generated: $pwd');
+                                  }
+                                },
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
                       const SizedBox(height: 12),
                       TextFormField(
@@ -1433,6 +1632,8 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
                         decoration: const InputDecoration(
                           labelText: 'Email Address',
                           labelStyle: TextStyle(color: Colors.white60),
+                          prefixIcon: Icon(Icons.email,
+                              color: Colors.white54, size: 20),
                         ),
                         validator: (val) =>
                         val == null || !val.contains('@')
@@ -1447,6 +1648,8 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
                         decoration: const InputDecoration(
                           labelText: 'Mobile Number',
                           labelStyle: TextStyle(color: Colors.white60),
+                          prefixIcon: Icon(Icons.phone,
+                              color: Colors.white54, size: 20),
                         ),
                         validator: (val) =>
                         val == null || val.trim().length < 10
@@ -1454,43 +1657,146 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
                             : null,
                       ),
                       const SizedBox(height: 12),
-                      DropdownButtonFormField<String>(
-                        value: availableRoleChoices.contains(selectedRole)
-                            ? selectedRole
-                            : availableRoleChoices.first,
-                        dropdownColor: const Color(0xFF16213E),
-                        style: const TextStyle(color: Colors.white),
-                        decoration: const InputDecoration(
-                          labelText: 'Role',
-                          labelStyle: TextStyle(color: Colors.white60),
-                        ),
-                        items: availableRoleChoices.map((role) {
-                          return DropdownMenuItem(
-                            value: role,
-                            child: Text(role),
-                          );
-                        }).toList(),
-                        onChanged: (value) {
-                          if (value != null) {
-                            setDialogState(() => selectedRole = value);
-                          }
-                        },
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Expanded(
+                            child: DropdownButtonFormField<String>(
+                              value: availableRoleChoices
+                                  .contains(selectedRole)
+                                  ? selectedRole
+                                  : availableRoleChoices.first,
+                              dropdownColor: const Color(0xFF16213E),
+                              style: const TextStyle(color: Colors.white),
+                              decoration: const InputDecoration(
+                                labelText: 'Role',
+                                labelStyle:
+                                TextStyle(color: Colors.white60),
+                                prefixIcon: Icon(Icons.work,
+                                    color: Colors.white54, size: 20),
+                              ),
+                              items: availableRoleChoices.map((role) {
+                                return DropdownMenuItem(
+                                  value: role,
+                                  child: Text(role),
+                                );
+                              }).toList(),
+                              onChanged: (value) {
+                                if (value != null) {
+                                  setDialogState(
+                                          () => selectedRole = value);
+                                }
+                              },
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Tooltip(
+                            message: canGeneratePwd
+                                ? 'Generate auto password'
+                                : 'Enter name & role first',
+                            child: Container(
+                              height: 48,
+                              width: 48,
+                              margin: const EdgeInsets.only(top: 8),
+                              decoration: BoxDecoration(
+                                color: canGeneratePwd
+                                    ? const Color(0xFFE94560)
+                                    : Colors.white12,
+                                borderRadius: BorderRadius.circular(10),
+                                boxShadow: canGeneratePwd
+                                    ? [
+                                  BoxShadow(
+                                    color: const Color(0xFFE94560)
+                                        .withOpacity(0.4),
+                                    blurRadius: 8,
+                                    spreadRadius: 1,
+                                  ),
+                                ]
+                                    : [],
+                              ),
+                              child: IconButton(
+                                icon: isGeneratingPwd
+                                    ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white),
+                                )
+                                    : const Icon(Icons.add,
+                                    color: Colors.white, size: 24),
+                                onPressed:
+                                (!canGeneratePwd || isGeneratingPwd)
+                                    ? null
+                                    : () async {
+                                  setDialogState(() =>
+                                  isGeneratingPwd = true);
+
+                                  String? pwd =
+                                  await _fetchAutoPassword(
+                                    nameController.text.trim(),
+                                    selectedRole,
+                                  );
+                                  pwd ??=
+                                      _generateLocalAutoPassword(
+                                        nameController.text.trim(),
+                                        selectedRole,
+                                      );
+
+                                  passwordController.text = pwd;
+
+                                  if (mounted) {
+                                    setDialogState(() {
+                                      isGeneratingPwd = false;
+                                    });
+                                    _showSnackBar(
+                                        '🔑 Auto password generated: $pwd');
+                                  }
+                                },
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
                       const SizedBox(height: 12),
                       TextFormField(
                         controller: passwordController,
-                        obscureText: true,
-                        style: const TextStyle(color: Colors.white),
+                        readOnly: true,
+                        obscureText: false,
+                        style: const TextStyle(
+                          color: Colors.greenAccent,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 1,
+                        ),
                         decoration: InputDecoration(
                           labelText: isEditing
-                              ? 'New Password (Optional)'
-                              : 'Password',
+                              ? 'Password (optional)'
+                              : 'Auto Password',
                           labelStyle: const TextStyle(color: Colors.white60),
+                          prefixIcon: const Icon(Icons.lock,
+                              color: Colors.greenAccent, size: 20),
+                          suffixIcon: passwordController.text.isNotEmpty
+                              ? IconButton(
+                            icon: const Icon(Icons.copy,
+                                color: Colors.greenAccent, size: 18),
+                            tooltip: 'Copy password',
+                            onPressed: () {
+                              _showSnackBar(
+                                  'Password: ${passwordController.text}');
+                            },
+                          )
+                              : null,
+                          helperText:
+                          'Format: GS-{name}:@{01}  •  Tap + to generate',
+                          helperStyle: TextStyle(
+                            color: Colors.white.withOpacity(0.4),
+                            fontSize: 10,
+                          ),
                         ),
                         validator: (val) {
                           if (!isEditing &&
                               (val == null || val.trim().length < 6)) {
-                            return 'Password must be at least 6 characters';
+                            return 'Tap + to generate auto password';
                           }
                           return null;
                         },
@@ -1566,8 +1872,8 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
 class LiveStreamSession {
   final String empId;
   final String empName;
-  final String pcNumber;
-  final String pcType;
+  final String pcNumber;   // "Personal PC" or "PC-01"
+  final String pcType;     // 'personal' or 'office'
 
   Timer? _pollTimer;
   Uint8List? currentFrameBytes;
@@ -1594,7 +1900,6 @@ class LiveStreamSession {
 
     _pollTimer?.cancel();
     _fetchFrame();
-    // ⭐ Poll every 2 seconds for faster updates
     _pollTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
       if (!isDisposed) {
         _fetchFrame();
@@ -1621,7 +1926,6 @@ class LiveStreamSession {
           final newFrameB64 = data['image_base64'] as String;
           final serverFrameCounter = data['frame_counter'] ?? 0;
 
-          // ⭐ Only decode if frame actually changed
           if (serverFrameCounter != lastFrameCounter) {
             final decodedBytes = await compute(_decodeBase64Task, newFrameB64);
 
@@ -1634,8 +1938,8 @@ class LiveStreamSession {
               windowTitle = data['window_title'];
               if (data['captured_at'] != null) {
                 try {
-                  capturedAt =
-                      DateTime.parse(data['captured_at'].replaceFirst(' ', 'T'));
+                  capturedAt = DateTime.parse(
+                      data['captured_at'].replaceFirst(' ', 'T'));
                 } catch (_) {}
               }
             }
@@ -2310,7 +2614,8 @@ class _HistoryDialogState extends State<_HistoryDialog> {
 
     const batchSize = 8;
     for (int i = 0; i < frames.length; i += batchSize) {
-      final end = (i + batchSize < frames.length) ? i + batchSize : frames.length;
+      final end =
+      (i + batchSize < frames.length) ? i + batchSize : frames.length;
 
       final futures = <Future<void>>[];
       for (int j = i; j < end; j++) {
@@ -2898,7 +3203,6 @@ class _HistoryDialogState extends State<_HistoryDialog> {
                           child: CircularProgressIndicator(
                               color: Colors.greenAccent, strokeWidth: 2),
                         ),
-
                       Positioned(
                         top: 8,
                         left: 8,
@@ -2934,7 +3238,6 @@ class _HistoryDialogState extends State<_HistoryDialog> {
                           ),
                         ),
                       ),
-
                       Positioned(
                         top: 8,
                         right: 8,
@@ -2959,7 +3262,6 @@ class _HistoryDialogState extends State<_HistoryDialog> {
                           ),
                         ),
                       ),
-
                       if (_isPlaying)
                         Positioned(
                           bottom: 8,
@@ -3037,7 +3339,6 @@ class _HistoryDialogState extends State<_HistoryDialog> {
                 );
               },
             ),
-
           if (totalFrames > 1)
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -3063,9 +3364,7 @@ class _HistoryDialogState extends State<_HistoryDialog> {
                 ],
               ),
             ),
-
           const SizedBox(height: 8),
-
           Row(
             children: [
               IconButton(
@@ -3164,7 +3463,6 @@ class _HistoryDialogState extends State<_HistoryDialog> {
               ),
             ],
           ),
-
           ValueListenableBuilder<int>(
             valueListenable: _frameNotifier,
             builder: (context, idx, _) {
@@ -3230,8 +3528,9 @@ class Employee {
       email: json['email'] ?? '',
       mobile: json['mobile'] ?? '',
       role: json['role'] ?? 'Employee',
-      pcNumber:
-      json['pc_number'] != null ? json['pc_number'].toString() : 'N/A',
+      pcNumber: json['pc_number'] != null
+          ? json['pc_number'].toString()
+          : 'N/A',
     );
   }
 
