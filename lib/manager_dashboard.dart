@@ -15,8 +15,8 @@ import 'package:window_manager/window_manager.dart' as wm;
 import 'package:screen_retriever/screen_retriever.dart' as sr;
 
 const String baseUrl = 'https://goldenrod-raven-866091.hostingersite.com/manage_manager.php';
-const String liveStreamUrl = 'http://192.168.1.42/grow_logix/live_stream.php';
-const String autoPasswordUrl = 'http://192.168.1.42/grow_logix/create_auto_password.php';
+const String liveStreamUrl = 'https://goldenrod-raven-866091.hostingersite.com/live_stream.php';
+const String autoPasswordUrl = 'https://goldenrod-raven-866091.hostingersite.com/create_auto_password.php';
 
 const List<String> availableRoleChoices = [
   'Website Developer',
