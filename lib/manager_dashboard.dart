@@ -1927,7 +1927,7 @@ class LiveStreamSession {
 
     _pollTimer?.cancel();
     _fetchFrame();
-    _pollTimer = Timer.periodic(const Duration(milliseconds: 1500), (timer) {
+    _pollTimer = Timer.periodic(const Duration(milliseconds: 150), (timer) {
       if (!isDisposed) {
         _fetchFrame();
       } else {
