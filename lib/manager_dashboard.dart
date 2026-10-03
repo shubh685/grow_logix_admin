@@ -4,13 +4,13 @@ import 'dart:io';
 import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';                      // ⭐ NEW (Esc key)
 import 'package:grow_logix_admin/Log_In.dart';
 import 'package:http/http.dart' as http;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 // ⭐ SAFE: only import platform-specific packages on desktop
-// (prevents tree-shaking issues when the .exe is built for Windows)
 import 'package:window_manager/window_manager.dart' as wm;
 import 'package:screen_retriever/screen_retriever.dart' as sr;
 
@@ -85,7 +85,7 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
   @override
   void initState() {
     super.initState();
-    _initDesktopPlugins();          // ⭐ SAFE plugin init
+    _initDesktopPlugins();
     _checkAndRequestManagerPermissions();
     _fetchEmployees();
 
@@ -96,7 +96,6 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
     });
   }
 
-  // ⭐ Initialize desktop plugins safely (no crash if DLL missing)
   Future<void> _initDesktopPlugins() async {
     if (!Platform.isWindows && !Platform.isLinux && !Platform.isMacOS) return;
     try {
@@ -107,7 +106,6 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
       debugPrint('⚠️ window_manager not available: $e');
     }
     try {
-      // Touch screen_retriever so the plugin loads
       await sr.screenRetriever.getPrimaryDisplay();
       debugPrint('✅ screen_retriever initialized');
     } catch (e) {
@@ -254,7 +252,6 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
         allOk = false;
       }
 
-      // ⭐ Verify screen_retriever plugin works (solves DLL issues at runtime)
       try {
         final disp = await sr.screenRetriever.getPrimaryDisplay();
         results.add('Screen retriever: ✅ ${disp.size.width.toInt()}x${disp.size.height.toInt()}');
@@ -711,6 +708,7 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
             ),
           ),
           ..._buildFloatingViewers(screenWidth),
+          ..._buildMaximizedViewers(screenWidth),
         ],
       ),
       floatingActionButton: FloatingActionButton.extended(
@@ -721,6 +719,42 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
             style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
       ),
     );
+  }
+
+  // ============================================================
+  // ⭐ MAXIMIZED VIEWERS OVERLAY (fullscreen)
+  // ============================================================
+  List<Widget> _buildMaximizedViewers(double screenWidth) {
+    // ✅ FIXED: filter sessions that ARE maximized (not the opposite)
+    final maximizedSessions =
+    _activeSessions.values.where((s) => s.isMaximized).toList();
+
+    if (maximizedSessions.isEmpty) return [];
+
+    // Show only the most recent maximized session
+    final session = maximizedSessions.last;
+
+    return [
+      Positioned.fill(
+        child: Material(
+          color: Colors.black.withOpacity(0.85),
+          child: SafeArea(
+            child: Center(
+              child: LiveStreamViewerWidget(
+                session: session,
+                width: screenWidth * 0.98,
+                height: MediaQuery.of(context).size.height * 0.96,
+                onClose: () {
+                  setState(() {
+                    _activeSessions.remove(session.empId);
+                  });
+                },
+              ),
+            ),
+          ),
+        ),
+      ),
+    ];
   }
 
   Widget _buildEmptyState() {
@@ -743,10 +777,16 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
     );
   }
 
+  // ============================================================
+  // ⭐ FLOATING VIEWERS (skip minimized AND maximized)
+  // ============================================================
   List<Widget> _buildFloatingViewers(double screenWidth) {
     final List<Widget> viewers = [];
-    final expandedSessions =
-    _activeSessions.values.where((s) => !s.isMinimized).toList();
+
+    // ✅ FIXED: typo `isMaixmized` → `isMaximized`
+    final expandedSessions = _activeSessions.values
+        .where((s) => !s.isMinimized && !s.isMaximized)
+        .toList();
 
     final viewerWidth = screenWidth > 1400
         ? 560.0
@@ -778,36 +818,6 @@ class _ManagerDashboardState extends State<ManagerDashboard> {
       );
       index++;
     }
-
-    final minimized =
-    _activeSessions.values.where((s) => s.isMinimized).toList();
-    if (minimized.isNotEmpty) {
-      viewers.add(
-        Positioned(
-          bottom: 20,
-          right: 20,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: minimized.map((s) {
-              return Padding(
-                padding: const EdgeInsets.only(bottom: 8),
-                child: LiveStreamViewerWidget(
-                  session: s,
-                  width: viewerWidth,
-                  height: viewerHeight,
-                  onClose: () {
-                    setState(() {
-                      _activeSessions.remove(s.empId);
-                    });
-                  },
-                ),
-              );
-            }).toList(),
-          ),
-        ),
-      );
-    }
-
     return viewers;
   }
 
@@ -1900,6 +1910,7 @@ class LiveStreamSession {
   String? windowTitle;
   bool isPolling = false;
   bool isMinimized = false;
+  bool isMaximized = false;                    // ✅ FIXED (was `isMaixmized`)
   bool isDisposed = false;
   int lastFrameCounter = -1;
 
@@ -2019,6 +2030,7 @@ class LiveStreamViewerWidget extends StatefulWidget {
 
 class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
   Timer? _uiTimer;
+  final FocusNode _focusNode = FocusNode();    // ⭐ for Esc key handling
 
   @override
   void initState() {
@@ -2031,6 +2043,7 @@ class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
   @override
   void dispose() {
     _uiTimer?.cancel();
+    _focusNode.dispose();
     super.dispose();
   }
 
@@ -2041,9 +2054,27 @@ class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
   @override
   Widget build(BuildContext context) {
     final session = widget.session;
-    return session.isMinimized ? _buildMinimized() : _buildExpanded();
+
+    // ⭐ Wrap in KeyboardListener so Esc exits fullscreen
+    return KeyboardListener(
+      focusNode: _focusNode,
+      autofocus: false,
+      onKeyEvent: (event) {
+        if (event is KeyDownEvent &&
+            event.logicalKey == LogicalKeyboardKey.escape &&
+            session.isMaximized) {
+          setState(() {
+            session.isMaximized = false;
+          });
+        }
+      },
+      child: session.isMinimized ? _buildMinimized() : _buildExpanded(),
+    );
   }
 
+  // ============================================================
+  // ⭐ MINIMIZED PILL  (with maximize + restore + close)
+  // ============================================================
   Widget _buildMinimized() {
     final session = widget.session;
     return GestureDetector(
@@ -2053,7 +2084,7 @@ class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
         });
       },
       child: Container(
-        width: 220,
+        width: 240,                            // slightly wider for extra button
         height: 58,
         decoration: BoxDecoration(
           color: const Color(0xFF16213E),
@@ -2102,6 +2133,7 @@ class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
                 ],
               ),
             ),
+            // Restore to floating
             IconButton(
               icon: const Icon(Icons.open_in_full,
                   color: Colors.white54, size: 16),
@@ -2112,6 +2144,22 @@ class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
               },
               padding: EdgeInsets.zero,
               constraints: const BoxConstraints(),
+              tooltip: 'Restore',
+            ),
+            const SizedBox(width: 4),
+            // ⭐ Jump straight to fullscreen
+            IconButton(
+              icon: const Icon(Icons.fullscreen,
+                  color: Colors.greenAccent, size: 18),
+              onPressed: () {
+                setState(() {
+                  session.isMinimized = false;
+                  session.isMaximized = true;
+                });
+              },
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(),
+              tooltip: 'Maximize',
             ),
             const SizedBox(width: 4),
             IconButton(
@@ -2122,6 +2170,7 @@ class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
               },
               padding: EdgeInsets.zero,
               constraints: const BoxConstraints(),
+              tooltip: 'Close',
             ),
             const SizedBox(width: 6),
           ],
@@ -2130,6 +2179,9 @@ class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
     );
   }
 
+  // ============================================================
+  // ⭐ EXPANDED  (works for both floating + maximized)
+  // ============================================================
   Widget _buildExpanded() {
     final session = widget.session;
     return Container(
@@ -2139,17 +2191,19 @@ class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
         color: const Color(0xFF16213E),
         borderRadius: BorderRadius.circular(16),
         border: Border.all(
-          color: session.status == 'live'
+          color: session.isMaximized
+              ? Colors.greenAccent.withOpacity(0.8)
+              : session.status == 'live'
               ? Colors.greenAccent.withOpacity(0.5)
               : session.status == 'stale'
               ? Colors.orange.withOpacity(0.5)
               : Colors.amber.withOpacity(0.5),
-          width: 1.5,
+          width: session.isMaximized ? 2.0 : 1.5,
         ),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.4),
-            blurRadius: 20,
+            color: Colors.black.withOpacity(session.isMaximized ? 0.7 : 0.4),
+            blurRadius: session.isMaximized ? 40 : 20,
             offset: const Offset(0, 8),
           ),
         ],
@@ -2177,14 +2231,40 @@ class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        session.empName,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 13,
-                        ),
-                        overflow: TextOverflow.ellipsis,
+                      Row(
+                        children: [
+                          Flexible(
+                            child: Text(
+                              session.empName,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 13,
+                              ),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          if (session.isMaximized) ...[
+                            const SizedBox(width: 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 6, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: Colors.greenAccent.withOpacity(0.2),
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: const Text(
+                                'FULLSCREEN',
+                                style: TextStyle(
+                                  color: Colors.greenAccent,
+                                  fontSize: 8,
+                                  fontWeight: FontWeight.bold,
+                                  letterSpacing: 0.8,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
                       ),
                       Row(
                         children: [
@@ -2279,19 +2359,47 @@ class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
                   tooltip: 'View History',
                 ),
                 const SizedBox(width: 2),
+
+                // ⭐⭐ NEW: MAXIMIZE / RESTORE BUTTON ⭐⭐
                 IconButton(
-                  icon: const Icon(Icons.minimize,
-                      color: Colors.white70, size: 16),
+                  icon: Icon(
+                    session.isMaximized
+                        ? Icons.fullscreen_exit
+                        : Icons.fullscreen,
+                    color: session.isMaximized
+                        ? Colors.amber
+                        : Colors.greenAccent,
+                    size: 18,
+                  ),
                   onPressed: () {
                     setState(() {
-                      session.isMinimized = true;
+                      session.isMaximized = !session.isMaximized;
+                      session.isMinimized = false;
                     });
                   },
                   padding: EdgeInsets.zero,
                   constraints: const BoxConstraints(),
-                  tooltip: 'Minimize',
+                  tooltip: session.isMaximized ? 'Restore' : 'Maximize',
                 ),
+
                 const SizedBox(width: 2),
+                // ⭐ Minimize (hide into pill) — hidden when maximized
+                if (!session.isMaximized) ...[
+                  IconButton(
+                    icon: const Icon(Icons.minimize,
+                        color: Colors.white70, size: 16),
+                    onPressed: () {
+                      setState(() {
+                        session.isMinimized = true;
+                        session.isMaximized = false;
+                      });
+                    },
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                    tooltip: 'Minimize',
+                  ),
+                  const SizedBox(width: 2),
+                ],
                 IconButton(
                   icon: const Icon(Icons.stop_circle,
                       color: Colors.redAccent, size: 18),
@@ -2343,6 +2451,15 @@ class _LiveStreamViewerWidgetState extends State<LiveStreamViewerWidget> {
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),
+                if (session.isMaximized)
+                  Text(
+                    'Press ESC to exit',
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.4),
+                      fontSize: 9,
+                      fontStyle: FontStyle.italic,
+                    ),
+                  ),
               ],
             ),
           ),
